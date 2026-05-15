@@ -16,6 +16,7 @@ const (
 	BASEURL = "https://api.wikimedia.org/feed/v1/wikipedia/en/onthisday/events/"
 	usragt  = "Mozilla/5.0 (X11; Linux x86_64; rv:150.0) Gecko/20100101 Firefox/150.0"
 	dbFile  = "todayfetch.db"
+	EventDailyCache = 3
 )
 
 type WikimediaResponse struct {
@@ -45,7 +46,6 @@ func events() {
 		return
 	}
 	defer db.Close()
-
 	if err := initDB(db); err != nil {
 		fmt.Printf("Error initializing database: %v\n", err)
 		return
@@ -55,7 +55,7 @@ func events() {
 	cached, err := getCachedEvents(db, date)
 	if err == nil && len(cached) > 0 {
 		fmt.Println("--- Loaded from Cache ---")
-		displayCachedEvents(cached, 3)
+		displayCachedEvents(cached, EventDailyCache)
 		return
 	}
 
@@ -84,7 +84,7 @@ func events() {
 		fmt.Printf("Error saving to database: %v\n", err)
 	}
 
-	displayCachedEvents(eventsToCache, 3)
+	displayCachedEvents(eventsToCache, EventDailyCache)
 }
 
 func initDB(db *sql.DB) error {
