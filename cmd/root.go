@@ -31,9 +31,7 @@ func Execute() {
 	if err != nil {
 		os.Exit(1)
 	}
-	// myua()
 	events()
-
 }
 
 func init() {

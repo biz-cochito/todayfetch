@@ -1,105 +1,160 @@
 package cmd
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
-const BASEURL = "https://api.wikimedia.org/feed/v1/wikipedia/en/onthisday/events/"
-const usragt = "Mozilla/5.0 (X11; Linux x86_64; rv:150.0) Gecko/20100101 Firefox/150.0"
+
+const (
+	BASEURL = "https://api.wikimedia.org/feed/v1/wikipedia/en/onthisday/events/"
+	usragt  = "Mozilla/5.0 (X11; Linux x86_64; rv:150.0) Gecko/20100101 Firefox/150.0"
+	dbFile  = "todayfetch.db"
+)
 
 type WikimediaResponse struct {
 	Events []struct {
 		Text  string `json:"text"`
 		Pages []struct {
-			Type         string `json:"type"`
-			Title        string `json:"title"`
-			Displaytitle string `json:"displaytitle"`
-			Namespace    struct {
-				ID   int    `json:"id"`
-				Text string `json:"text"`
-			} `json:"namespace"`
-			WikibaseItem string `json:"wikibase_item"`
-			Titles       struct {
-				Canonical  string `json:"canonical"`
-				Normalized string `json:"normalized"`
-				Display    string `json:"display"`
-			} `json:"titles"`
-			Pageid    int `json:"pageid"`
-			Thumbnail struct {
-				Source string `json:"source"`
-				Width  int    `json:"width"`
-				Height int    `json:"height"`
-			} `json:"thumbnail"`
-			Originalimage struct {
-				Source string `json:"source"`
-				Width  int    `json:"width"`
-				Height int    `json:"height"`
-			} `json:"originalimage"`
-			Lang              string    `json:"lang"`
-			Dir               string    `json:"dir"`
-			Revision          string    `json:"revision"`
-			Tid               string    `json:"tid"`
-			Timestamp         time.Time `json:"timestamp"`
-			Description       string    `json:"description"`
-			DescriptionSource string    `json:"description_source"`
-			ContentUrls       struct {
+			ContentUrls struct {
 				Desktop struct {
-					Page      string `json:"page"`
-					Revisions string `json:"revisions"`
-					Edit      string `json:"edit"`
-					Talk      string `json:"talk"`
+					Page string `json:"page"`
 				} `json:"desktop"`
-				Mobile struct {
-					Page      string `json:"page"`
-					Revisions string `json:"revisions"`
-					Edit      string `json:"edit"`
-					Talk      string `json:"talk"`
-				} `json:"mobile"`
 			} `json:"content_urls"`
-			Extract         string `json:"extract"`
-			ExtractHTML     string `json:"extract_html"`
-			Normalizedtitle string `json:"normalizedtitle"`
-			Coordinates     struct {
-				Lat float64 `json:"lat"`
-				Lon float64 `json:"lon"`
-			} `json:"coordinates,omitempty"`
 		} `json:"pages"`
 		Year int `json:"year"`
 	} `json:"events"`
 }
 
-
-func events() {
-	body := getWikimediaResponse()
-	displayEvents(body)
+type CachedEvent struct {
+	Year int
+	Text string
+	URL  string
 }
 
-func displayEvents(body []byte) {
+func events() {
+	db, err := sql.Open("sqlite", dbFile)
+	if err != nil {
+		fmt.Printf("Error opening database: %v\n", err)
+		return
+	}
+	defer db.Close()
+
+	if err := initDB(db); err != nil {
+		fmt.Printf("Error initializing database: %v\n", err)
+		return
+	}
+
+	date := getDate()
+	cached, err := getCachedEvents(db, date)
+	if err == nil && len(cached) > 0 {
+		fmt.Println("--- Loaded from Cache ---")
+		displayCachedEvents(cached, 3)
+		return
+	}
+
+	fmt.Println("--- Fetching from API ---")
+	body := getWikimediaResponse(date)
 	var res WikimediaResponse
 	if err := json.Unmarshal(body, &res); err != nil {
 		fmt.Printf("Error unmarshalling response: %v\n", err)
 		return
 	}
-	if len(res.Events) > 10 {
-		res.Events = res.Events[:10]
+
+	eventsToCache := []CachedEvent{}
+	for _, e := range res.Events {
+		url := ""
+		if len(e.Pages) > 0 {
+			url = e.Pages[0].ContentUrls.Desktop.Page
+		}
+		eventsToCache = append(eventsToCache, CachedEvent{
+			Year: e.Year,
+			Text: e.Text,
+			URL:  url,
+		})
 	}
-	for _, rec := range res.Events {
-		fmt.Println(rec.Text)
+
+	if err := saveEvents(db, date, eventsToCache); err != nil {
+		fmt.Printf("Error saving to database: %v\n", err)
+	}
+
+	displayCachedEvents(eventsToCache, 3)
+}
+
+func initDB(db *sql.DB) error {
+	query := `
+	CREATE TABLE IF NOT EXISTS events (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		date TEXT,
+		year INTEGER,
+		text TEXT,
+		url TEXT
+	);`
+	_, err := db.Exec(query)
+	return err
+}
+
+func getCachedEvents(db *sql.DB, date string) ([]CachedEvent, error) {
+	rows, err := db.Query("SELECT year, text, url FROM events WHERE date = ?", date)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []CachedEvent
+	for rows.Next() {
+		var e CachedEvent
+		if err := rows.Scan(&e.Year, &e.Text, &e.URL); err != nil {
+			return nil, err
+		}
+		events = append(events, e)
+	}
+	return events, nil
+}
+
+func saveEvents(db *sql.DB, date string, events []CachedEvent) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	stmt, err := tx.Prepare("INSERT INTO events(date, year, text, url) VALUES(?, ?, ?, ?)")
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, e := range events {
+		_, err := stmt.Exec(date, e.Year, e.Text, e.URL)
+		if err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func displayCachedEvents(events []CachedEvent, limit int) {
+	if len(events) > limit {
+		events = events[:limit]
+	}
+	for _, e := range events {
+		fmt.Printf("[%d] %s\nURL: %s\n\n", e.Year, e.Text, e.URL)
 	}
 }
 
-func getWikimediaResponse() []byte {
+func getWikimediaResponse(date string) []byte {
 	client := &http.Client{}
-	wikimediaurl := constructEventURL(BASEURL)
+	wikimediaurl := constructEventURL(BASEURL, date)
 
 	req, err := http.NewRequest("GET", wikimediaurl, nil)
 	if err != nil {
-		fmt.Printf("Error fetching URL: %v\n", err)
+		fmt.Printf("Error creating request: %v\n", err)
 	}
 	req.Header.Set("User-Agent", usragt)
 	resp, err := client.Do(req)
@@ -107,23 +162,15 @@ func getWikimediaResponse() []byte {
 		fmt.Printf("Error fetching URL: %v\n", err)
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body) // body is []byte
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		fmt.Printf("Error reading response body: %v\n", err)
 	}
 	return body
 }
 
-func PrettyPrint(response WikimediaResponse) string {
-
-    s, _ := json.MarshalIndent(response, "", "\t")
-
-    return string(s)
-
-}
-
-func constructEventURL(link string) string {
-	wikimediaurl, err := url.JoinPath(link, getDate())
+func constructEventURL(link, date string) string {
+	wikimediaurl, err := url.JoinPath(link, date)
 	if err != nil {
 		return "Failed to construct URL: " + err.Error()
 	}
@@ -132,21 +179,5 @@ func constructEventURL(link string) string {
 
 func getDate() string {
 	now := time.Now()
-	monthInt := int(now.Month())
-	dayInt := int(now.Day())
-	month := formatDate(monthInt)
-	day := formatDate(dayInt)
-	dateStr := month + "/" + day
-	fmt.Println(dateStr)
-	return dateStr
-}
-
-func formatDate(x int) string {
-	var str string
-	if x < 10 {
-		str = "0" + strconv.Itoa(x)
-	} else {
-		str = strconv.Itoa(x)
-	}
-	return str
+	return fmt.Sprintf("%02d/%02d", now.Month(), now.Day())
 }
